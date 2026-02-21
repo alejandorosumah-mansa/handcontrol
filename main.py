@@ -1,0 +1,377 @@
+"""
+HandControl Main Application Loop
+Integrates camera, hand tracking, gesture recognition, and cursor control
+"""
+import time
+import sys
+import platform
+from typing import Optional, Dict, Any
+import pyautogui
+
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+    print("Warning: OpenCV not available. Preview functionality will be limited.")
+
+# Import HandControl modules
+from config import Config
+from camera import Camera
+from hand_tracker import HandTracker
+from gesture_recognition import GestureRecognizer, GestureType
+from cursor_control import CursorController
+
+class HandControlApp:
+    """
+    Main HandControl application
+    Handles the complete pipeline: Camera → landmarks → gesture → cursor action
+    """
+    
+    def __init__(self, config_path: Optional[str] = None, preview: bool = True):
+        """
+        Initialize HandControl application
+        
+        Args:
+            config_path: Path to config file (uses default if None)
+            preview: Show preview window
+        """
+        # Load configuration
+        self.config = Config(config_path) if config_path else Config()
+        self.show_preview = preview and self.config.get('display.show_preview', True)
+        
+        # Initialize components
+        print("Initializing HandControl...")
+        
+        # Initialize camera with config parameters
+        camera_config = self.config.get('camera', {})
+        self.camera = Camera(
+            camera_index=camera_config.get('index', 0),
+            width=camera_config.get('width', 640),
+            height=camera_config.get('height', 480),
+            fps_target=camera_config.get('fps_target', 30),
+            mirror=camera_config.get('mirror', True)
+        )
+        
+        self.tracker = HandTracker(self.config) 
+        self.gesture_recognizer = GestureRecognizer(**self._get_gesture_config())
+        self.cursor_controller = CursorController(self.config)
+        
+        # Open camera connection
+        if not self.camera.open():
+            raise RuntimeError("Failed to open camera")
+        
+        # Ensure pyautogui FAILSAFE is always enabled
+        pyautogui.FAILSAFE = True
+        
+        # Application state
+        self.is_paused = False
+        self.is_running = False
+        
+        # Gesture cooldowns (in seconds) 
+        self.last_click_time = 0.0
+        self.last_scroll_time = 0.0
+        self.click_cooldown = self.config.get('gestures.cooldown_click_ms', 300) / 1000.0
+        self.scroll_cooldown = self.config.get('gestures.cooldown_scroll_ms', 50) / 1000.0
+        
+        # Keyboard mode state
+        self.keyboard_mode_active = False
+        self.keyboard_mode_start_time = 0.0
+        self.keyboard_hold_time = self.config.get('gestures.keyboard_hold_time', 1.0)
+        
+        # Platform detection for keyboard shortcuts
+        self.is_macos = platform.system() == 'Darwin'
+        
+        print("🎮 HandControl initialized!")
+        print("Controls:")
+        print("  p = pause/resume")
+        print("  q = quit") 
+        print("  r = reset smoothing")
+        print("") 
+        print("Gestures:")
+        print("  👆 MOVE → cursor follows index finger")
+        print("  🤏 LEFT_CLICK → pinch index+middle")
+        print("  🫴 RIGHT_CLICK → 3 finger pinch")
+        print("  👌 DOUBLE_CLICK → thumb-index pinch")  
+        print("  ✌️ SCROLL → 2 fingers spread, Y movement")
+        print("  ✊👍 DRAG → fist+thumb → toggle drag")
+        print("  🖐️ KEYBOARD → all 5 fingers held 1 second")
+        print("")
+    
+    def _get_gesture_config(self) -> Dict[str, Any]:
+        """Get gesture recognition configuration"""
+        gestures = self.config.get('gestures', {})
+        return {
+            'finger_threshold': gestures.get('finger_threshold', 0.15),
+            'pinch_threshold': gestures.get('pinch_threshold', 0.08),
+            'stability_frames': gestures.get('stability_frames', 3),
+            'cooldown_click_ms': gestures.get('cooldown_click_ms', 300),
+            'cooldown_scroll_ms': gestures.get('cooldown_scroll_ms', 50),
+            'keyboard_hold_time': gestures.get('keyboard_hold_time', 1.0)
+        }
+    
+    def _can_click(self) -> bool:
+        """Check if enough time has passed since last click"""
+        return time.time() - self.last_click_time > self.click_cooldown
+    
+    def _can_scroll(self) -> bool:
+        """Check if enough time has passed since last scroll"""
+        return time.time() - self.last_scroll_time > self.scroll_cooldown
+    
+    def _handle_gesture(self, gesture_type: GestureType, gesture_data: Dict[str, Any], landmarks) -> None:
+        """
+        Handle detected gesture
+        
+        Args:
+            gesture_type: Detected gesture
+            gesture_data: Additional gesture data
+            landmarks: Hand landmarks for position data
+        """
+        current_time = time.time()
+        
+        if gesture_type == GestureType.MOVE:
+            # Move cursor to index finger position
+            if landmarks:
+                index_tip = landmarks.get_landmark(8)  # INDEX_FINGER_TIP
+                if index_tip:
+                    # Convert normalized coordinates to pixel coordinates
+                    frame_height, frame_width = frame.shape[:2]
+                    
+                    finger_x = index_tip[0] * frame_width
+                    finger_y = index_tip[1] * frame_height
+                    
+                    self.cursor_controller.move_cursor(finger_x, finger_y, frame_width, frame_height)
+        
+        elif gesture_type == GestureType.LEFT_CLICK:
+            if self._can_click():
+                print("👆 Left Click")
+                self.cursor_controller.left_click()
+                self.last_click_time = current_time
+        
+        elif gesture_type == GestureType.RIGHT_CLICK:
+            if self._can_click():
+                print("🫴 Right Click")
+                self.cursor_controller.right_click()
+                self.last_click_time = current_time
+        
+        elif gesture_type == GestureType.DOUBLE_CLICK:
+            if self._can_click():
+                print("👌 Double Click")
+                self.cursor_controller.double_click()
+                self.last_click_time = current_time
+        
+        elif gesture_type == GestureType.SCROLL:
+            if self._can_scroll():
+                # Get scroll direction from gesture data
+                scroll_delta = gesture_data.get('scroll_delta', 0)
+                if abs(scroll_delta) > 5:  # Minimum movement threshold
+                    direction = 1 if scroll_delta > 0 else -1
+                    print(f"✌️ Scroll {'Up' if direction > 0 else 'Down'}")
+                    self.cursor_controller.scroll(direction)
+                    self.last_scroll_time = current_time
+        
+        elif gesture_type == GestureType.DRAG:
+            print("✊👍 Toggle Drag")
+            self.cursor_controller.toggle_drag()
+        
+        elif gesture_type == GestureType.KEYBOARD:
+            if not self.keyboard_mode_active:
+                self.keyboard_mode_active = True
+                self.keyboard_mode_start_time = current_time
+                print("🖐️ Entering Keyboard Mode...")
+            
+            # Check if held long enough
+            if current_time - self.keyboard_mode_start_time >= self.keyboard_hold_time:
+                print("⌨️ KEYBOARD MODE ACTIVE")
+                self._handle_keyboard_mode(gesture_data)
+                self.keyboard_mode_active = False
+        
+        else:  # IDLE or other
+            # Reset keyboard mode if not holding all fingers
+            if self.keyboard_mode_active and gesture_type != GestureType.KEYBOARD:
+                self.keyboard_mode_active = False
+    
+    def _handle_keyboard_mode(self, gesture_data: Dict[str, Any]) -> None:
+        """
+        Handle keyboard shortcuts based on finger count
+        
+        Args:
+            gesture_data: Gesture data containing finger information
+        """
+        # Count extended fingers (excluding thumb for some gestures)
+        finger_count = gesture_data.get('finger_count', 0)
+        thumb_extended = gesture_data.get('thumb_extended', False)
+        
+        print(f"Keyboard gesture: {finger_count} fingers, thumb: {thumb_extended}")
+        
+        if finger_count == 1:  # Index only
+            print("⚡ Escape")
+            self.cursor_controller.keyboard_shortcut(['escape'])
+        
+        elif finger_count == 2:  # Index + Middle
+            print("↵ Enter")  
+            self.cursor_controller.keyboard_shortcut(['enter'])
+        
+        elif finger_count == 3:  # Index + Middle + Ring
+            if self.is_macos:
+                print("📋 Cmd+C (Copy)")
+                self.cursor_controller.keyboard_shortcut(['cmd', 'c'])
+            else:
+                print("📋 Ctrl+C (Copy)")
+                self.cursor_controller.keyboard_shortcut(['ctrl', 'c'])
+        
+        elif finger_count == 4:  # All fingers except thumb
+            if self.is_macos:
+                print("📄 Cmd+V (Paste)")
+                self.cursor_controller.keyboard_shortcut(['cmd', 'v'])
+            else:
+                print("📄 Ctrl+V (Paste)")
+                self.cursor_controller.keyboard_shortcut(['ctrl', 'v'])
+        
+        elif finger_count == 0 and thumb_extended:  # Thumb only
+            if self.is_macos:
+                print("🔄 Cmd+Tab (App Switch)")
+                self.cursor_controller.keyboard_shortcut(['cmd', 'tab'])
+            else:
+                print("🔄 Alt+Tab (App Switch)")
+                self.cursor_controller.keyboard_shortcut(['alt', 'tab'])
+        
+        # Auto-exit keyboard mode
+        self.keyboard_mode_active = False
+    
+    def _draw_status(self, frame, gesture_type: GestureType) -> None:
+        """
+        Draw status information on frame
+        
+        Args:
+            frame: OpenCV frame
+            gesture_type: Current gesture
+        """
+        if not CV2_AVAILABLE:
+            return
+            
+        h, w = frame.shape[:2]
+        
+        # Status text
+        status_text = f"{'PAUSED' if self.is_paused else 'ACTIVE'} | {gesture_type.value.upper()}"
+        if self.keyboard_mode_active:
+            remaining = max(0, self.keyboard_hold_time - (time.time() - self.keyboard_mode_start_time))
+            status_text += f" | KEYBOARD {remaining:.1f}s"
+        
+        # Draw background rectangle
+        text_size = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+        cv2.rectangle(frame, (10, 10), (text_size[0] + 20, 50), (0, 0, 0), -1)
+        
+        # Draw text
+        color = (0, 255, 0) if not self.is_paused else (0, 255, 255)
+        cv2.putText(frame, status_text, (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        
+        # Draw controls
+        controls = "p=pause | q=quit | r=reset"
+        cv2.putText(frame, controls, (15, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    
+    def run(self) -> None:
+        """Run the main application loop"""
+        print("🚀 Starting HandControl...")
+        self.is_running = True
+        
+        try:
+            while self.is_running:
+                # Capture frame
+                success, frame = self.camera.read()
+                if not success or frame is None:
+                    print("❌ Failed to get camera frame")
+                    break
+                
+                current_gesture = GestureType.IDLE
+                gesture_data = {}
+                
+                if not self.is_paused:
+                    # Track hand
+                    landmarks = self.tracker.track(frame)
+                    
+                    if landmarks:
+                        # Recognize gesture
+                        gesture_state = self.gesture_recognizer.recognize(landmarks)
+                        
+                        if gesture_state:
+                            current_gesture = gesture_state.gesture_type
+                            gesture_data = gesture_state.data
+                            
+                            # Handle the gesture
+                            self._handle_gesture(current_gesture, gesture_data, landmarks)
+                        
+                        # Draw landmarks on preview
+                        if self.show_preview:
+                            self.tracker.draw_landmarks(frame, landmarks)
+                
+                # Show preview window
+                if self.show_preview and CV2_AVAILABLE:
+                    self._draw_status(frame, current_gesture)
+                    cv2.imshow('HandControl', frame)
+                    
+                    # Handle keyboard input
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        print("👋 Quitting...")
+                        break
+                    elif key == ord('p'):
+                        self.is_paused = not self.is_paused
+                        print(f"⏸️ {'Paused' if self.is_paused else 'Resumed'}")
+                    elif key == ord('r'):
+                        self.cursor_controller.reset_smoothing()
+                        print("🔄 Smoothing reset")
+                else:
+                    # Small delay to prevent excessive CPU usage in headless mode
+                    time.sleep(0.001)
+        
+        except KeyboardInterrupt:
+            print("\n👋 Interrupted by user")
+        
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        finally:
+            self.cleanup()
+    
+    def cleanup(self) -> None:
+        """Clean up resources"""
+        print("🧹 Cleaning up...")
+        
+        # Stop any ongoing drag
+        if hasattr(self.cursor_controller, 'is_dragging') and self.cursor_controller.is_dragging:
+            self.cursor_controller.stop_drag()
+        
+        # Release camera
+        self.camera.close()
+        
+        # Close windows
+        if self.show_preview and CV2_AVAILABLE:
+            cv2.destroyAllWindows()
+        
+        print("✅ Cleanup complete")
+
+
+def main():
+    """Entry point for HandControl application"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='HandControl - Gesture-based cursor control')
+    parser.add_argument('--config', type=str, help='Path to configuration file')
+    parser.add_argument('--no-preview', action='store_true', help='Run without preview window')
+    
+    args = parser.parse_args()
+    
+    # Create and run application
+    app = HandControlApp(
+        config_path=args.config,
+        preview=not args.no_preview
+    )
+    
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
