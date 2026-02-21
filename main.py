@@ -21,6 +21,7 @@ from camera import Camera
 from hand_tracker import HandTracker
 from gesture_recognition import GestureRecognizer, GestureType
 from cursor_control import CursorController
+from keyboard_mode import KeyboardMode, KeyboardModeVisualizer
 
 class HandControlApp:
     """
@@ -57,6 +58,11 @@ class HandControlApp:
         self.gesture_recognizer = GestureRecognizer(**self._get_gesture_config())
         self.cursor_controller = CursorController(self.config)
         
+        # Initialize enhanced keyboard mode
+        keyboard_hold_time = self.config.get('gestures.keyboard_hold_time', 1.0)
+        self.keyboard_mode = KeyboardMode(hold_time=keyboard_hold_time, feedback_callback=self._keyboard_feedback)
+        self.keyboard_visualizer = KeyboardModeVisualizer()
+        
         # Open camera connection
         if not self.camera.open():
             raise RuntimeError("Failed to open camera")
@@ -74,10 +80,8 @@ class HandControlApp:
         self.click_cooldown = self.config.get('gestures.cooldown_click_ms', 300) / 1000.0
         self.scroll_cooldown = self.config.get('gestures.cooldown_scroll_ms', 50) / 1000.0
         
-        # Keyboard mode state
-        self.keyboard_mode_active = False
-        self.keyboard_mode_start_time = 0.0
-        self.keyboard_hold_time = self.config.get('gestures.keyboard_hold_time', 1.0)
+        # Keyboard mode feedback state
+        self.keyboard_feedback_message = ""
         
         # Platform detection for keyboard shortcuts
         self.is_macos = platform.system() == 'Darwin'
@@ -109,6 +113,25 @@ class HandControlApp:
             'cooldown_scroll_ms': gestures.get('cooldown_scroll_ms', 50),
             'keyboard_hold_time': gestures.get('keyboard_hold_time', 1.0)
         }
+    
+    def _keyboard_feedback(self, event: str, data: Dict[str, Any]) -> None:
+        """
+        Handle keyboard mode feedback
+        
+        Args:
+            event: Feedback event type
+            data: Event data
+        """
+        if event == "keyboard_activating":
+            remaining = data.get('remaining', 0)
+            self.keyboard_feedback_message = f"KEYBOARD {remaining:.1f}s"
+        elif event == "keyboard_active":
+            self.keyboard_feedback_message = "KEYBOARD MODE"
+        elif event == "keyboard_inactive":
+            self.keyboard_feedback_message = ""
+        elif event == "shortcut_executed":
+            shortcut = data.get('shortcut', '')
+            self.keyboard_feedback_message = f"EXECUTED: {shortcut.upper()}"
     
     def _can_click(self) -> bool:
         """Check if enough time has passed since last click"""
@@ -175,69 +198,22 @@ class HandControlApp:
             self.cursor_controller.toggle_drag()
         
         elif gesture_type == GestureType.KEYBOARD:
-            if not self.keyboard_mode_active:
-                self.keyboard_mode_active = True
-                self.keyboard_mode_start_time = current_time
-                print("🖐️ Entering Keyboard Mode...")
+            # Use enhanced keyboard mode
+            all_fingers_extended = gesture_data.get('finger_count', 0) == 5
+            shortcut = self.keyboard_mode.update(all_fingers_extended, gesture_data)
             
-            # Check if held long enough
-            if current_time - self.keyboard_mode_start_time >= self.keyboard_hold_time:
-                print("⌨️ KEYBOARD MODE ACTIVE")
-                self._handle_keyboard_mode(gesture_data)
-                self.keyboard_mode_active = False
+            if shortcut:
+                self.keyboard_mode.execute_shortcut(shortcut)
         
         else:  # IDLE or other
-            # Reset keyboard mode if not holding all fingers
-            if self.keyboard_mode_active and gesture_type != GestureType.KEYBOARD:
-                self.keyboard_mode_active = False
+            # Update keyboard mode with current finger state
+            if gesture_type == GestureType.IDLE:
+                # Reset keyboard mode if idle
+                self.keyboard_mode.update(False, {})
     
-    def _handle_keyboard_mode(self, gesture_data: Dict[str, Any]) -> None:
-        """
-        Handle keyboard shortcuts based on finger count
-        
-        Args:
-            gesture_data: Gesture data containing finger information
-        """
-        # Count extended fingers (excluding thumb for some gestures)
-        finger_count = gesture_data.get('finger_count', 0)
-        thumb_extended = gesture_data.get('thumb_extended', False)
-        
-        print(f"Keyboard gesture: {finger_count} fingers, thumb: {thumb_extended}")
-        
-        if finger_count == 1:  # Index only
-            print("⚡ Escape")
-            self.cursor_controller.keyboard_shortcut(['escape'])
-        
-        elif finger_count == 2:  # Index + Middle
-            print("↵ Enter")  
-            self.cursor_controller.keyboard_shortcut(['enter'])
-        
-        elif finger_count == 3:  # Index + Middle + Ring
-            if self.is_macos:
-                print("📋 Cmd+C (Copy)")
-                self.cursor_controller.keyboard_shortcut(['cmd', 'c'])
-            else:
-                print("📋 Ctrl+C (Copy)")
-                self.cursor_controller.keyboard_shortcut(['ctrl', 'c'])
-        
-        elif finger_count == 4:  # All fingers except thumb
-            if self.is_macos:
-                print("📄 Cmd+V (Paste)")
-                self.cursor_controller.keyboard_shortcut(['cmd', 'v'])
-            else:
-                print("📄 Ctrl+V (Paste)")
-                self.cursor_controller.keyboard_shortcut(['ctrl', 'v'])
-        
-        elif finger_count == 0 and thumb_extended:  # Thumb only
-            if self.is_macos:
-                print("🔄 Cmd+Tab (App Switch)")
-                self.cursor_controller.keyboard_shortcut(['cmd', 'tab'])
-            else:
-                print("🔄 Alt+Tab (App Switch)")
-                self.cursor_controller.keyboard_shortcut(['alt', 'tab'])
-        
-        # Auto-exit keyboard mode
-        self.keyboard_mode_active = False
+    def _legacy_keyboard_mode_removed(self) -> None:
+        """Legacy method - replaced by KeyboardMode class"""
+        pass
     
     def _draw_status(self, frame, gesture_type: GestureType) -> None:
         """
@@ -254,9 +230,8 @@ class HandControlApp:
         
         # Status text
         status_text = f"{'PAUSED' if self.is_paused else 'ACTIVE'} | {gesture_type.value.upper()}"
-        if self.keyboard_mode_active:
-            remaining = max(0, self.keyboard_hold_time - (time.time() - self.keyboard_mode_start_time))
-            status_text += f" | KEYBOARD {remaining:.1f}s"
+        if self.keyboard_feedback_message:
+            status_text += f" | {self.keyboard_feedback_message}"
         
         # Draw background rectangle
         text_size = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
@@ -308,6 +283,14 @@ class HandControlApp:
                 # Show preview window
                 if self.show_preview and CV2_AVAILABLE:
                     self._draw_status(frame, current_gesture)
+                    
+                    # Draw keyboard mode visual feedback
+                    keyboard_status = self.keyboard_mode.get_status()
+                    self.keyboard_visualizer.draw_keyboard_status(frame, keyboard_status)
+                    
+                    if keyboard_status['is_active'] or keyboard_status['is_activating']:
+                        self.keyboard_visualizer.draw_shortcut_reference(frame)
+                    
                     cv2.imshow('HandControl', frame)
                     
                     # Handle keyboard input
