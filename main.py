@@ -81,9 +81,23 @@ class HandControlApp:
         )
         self.keyboard_visualizer = KeyboardModeVisualizer()
 
-        # Open camera
+        # Open camera (with retry for macOS permission prompt)
         if not self.camera.open():
-            raise RuntimeError("Failed to open camera")
+            import time
+            print("Camera not available. Waiting for permission grant...")
+            # macOS may need a moment after permission is granted
+            for attempt in range(5):
+                time.sleep(2)
+                print(f"  Retry {attempt + 1}/5...")
+                if self.camera.open():
+                    break
+            else:
+                print("ERROR: Could not open camera after 5 retries.")
+                print("Please grant camera access in System Settings > Privacy & Security > Camera")
+                raise RuntimeError(
+                    "Failed to open camera. Grant camera permission in "
+                    "System Settings > Privacy & Security > Camera, then relaunch."
+                )
 
         pyautogui.FAILSAFE = True
 

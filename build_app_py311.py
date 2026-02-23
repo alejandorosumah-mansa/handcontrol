@@ -151,6 +151,23 @@ def build_app(venv_path):
     # Use Python from the venv
     python_path = venv_path / "bin" / "python"
 
+    # Create a custom Info.plist with camera permission
+    plist_additions = Path('build_resources') / 'additions.plist'
+    plist_additions.parent.mkdir(exist_ok=True)
+    plist_additions.write_text("""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSCameraUsageDescription</key>
+    <string>Minority Report needs camera access to track your hand gestures for cursor control.</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.handcontrol.minorityreport</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.1</string>
+</dict>
+</plist>
+""")
+
     cmd = [
         str(python_path), '-m', 'PyInstaller',
         '--name', 'Minority Report',
@@ -178,6 +195,22 @@ def build_app(venv_path):
     result = subprocess.run(cmd)
 
     if result.returncode == 0:
+        # Merge camera permission into Info.plist
+        import plistlib
+        plist_path = Path('dist/Minority Report.app/Contents/Info.plist')
+        if plist_path.exists():
+            with open(plist_path, 'rb') as f:
+                plist = plistlib.load(f)
+            plist['NSCameraUsageDescription'] = (
+                'Minority Report needs camera access to track your hand gestures for cursor control.'
+            )
+            plist['CFBundleIdentifier'] = 'com.handcontrol.minorityreport'
+            plist['CFBundleVersion'] = '1.0.1'
+            plist['CFBundleShortVersionString'] = '1.0.1'
+            with open(plist_path, 'wb') as f:
+                plistlib.dump(plist, f)
+            print("✅ Added NSCameraUsageDescription to Info.plist")
+
         print("\n✅ Build successful!")
         print("App: dist/Minority Report.app")
         print("\nTo test:")
