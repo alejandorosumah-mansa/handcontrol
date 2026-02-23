@@ -51,8 +51,15 @@ test:
 		exit 1; \
 	fi
 
+# Ad-hoc codesign (removes Gatekeeper "malware" warning for local installs)
+sign:
+	@echo "Ad-hoc signing app..."
+	xattr -cr "dist/Minority Report.app"
+	codesign --force --deep --sign - "dist/Minority Report.app"
+	@echo "✅ App signed"
+
 # Create DMG
-dmg: test
+dmg: test sign
 	@echo "Creating DMG..."
 	hdiutil create -volname "Minority Report" -srcfolder "dist/Minority Report.app" -ov -format UDZO "dist/MinorityReport.dmg"
 	@echo "✅ DMG created: dist/MinorityReport.dmg"
