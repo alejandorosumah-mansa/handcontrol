@@ -62,4 +62,7 @@ coverage.xml
 calibration.json
 
 # Config overrides
-config_local.yaml
+config_local.yamlvenv_py311/
+build/
+dist/
+build_resources/
