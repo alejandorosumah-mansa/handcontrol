@@ -1,8 +1,8 @@
 """
 Hand tracking module using MediaPipe Hands
-Wraps MediaPipe for hand landmark detection and drawing
+Supports two-hand tracking with handedness detection.
 """
-from typing import Optional, List, Tuple, NamedTuple
+from typing import Optional, List, Tuple, NamedTuple, Dict
 import numpy as np
 
 try:
@@ -17,16 +17,16 @@ try:
 except ImportError:
     MEDIAPIPE_AVAILABLE = False
 
+
 class HandLandmark(NamedTuple):
-    """Single hand landmark with normalized coordinates"""
-    x: float  # Normalized x coordinate (0.0 - 1.0)
-    y: float  # Normalized y coordinate (0.0 - 1.0) 
-    z: float  # Relative z coordinate (depth)
+    x: float
+    y: float
+    z: float
+
 
 class HandLandmarks:
     """Collection of 21 hand landmarks with helper methods"""
-    
-    # MediaPipe hand landmark indices
+
     WRIST = 0
     THUMB_CMC = 1
     THUMB_MCP = 2
@@ -48,262 +48,141 @@ class HandLandmarks:
     PINKY_PIP = 18
     PINKY_DIP = 19
     PINKY_TIP = 20
-    
-    def __init__(self, landmarks: List[HandLandmark]):
-        """
-        Initialize hand landmarks
-        
-        Args:
-            landmarks: List of 21 HandLandmark objects
-        """
+
+    def __init__(self, landmarks: List[HandLandmark], handedness: str = "Right"):
         if len(landmarks) != 21:
             raise ValueError(f"Expected 21 landmarks, got {len(landmarks)}")
-        
         self.landmarks = landmarks
-    
+        self.handedness = handedness  # "Right" or "Left"
+
     def __getitem__(self, index: int) -> HandLandmark:
-        """Get landmark by index"""
         return self.landmarks[index]
-    
+
     def get_landmark(self, index: int) -> HandLandmark:
-        """Get landmark by index with bounds checking"""
         if 0 <= index < len(self.landmarks):
             return self.landmarks[index]
         raise IndexError(f"Landmark index {index} out of range")
-    
+
     def to_pixel_coordinates(self, frame_width: int, frame_height: int) -> List[Tuple[int, int]]:
-        """
-        Convert normalized coordinates to pixel coordinates
-        
-        Args:
-            frame_width: Frame width in pixels
-            frame_height: Frame height in pixels
-            
-        Returns:
-            List of (x, y) pixel coordinates
-        """
-        pixel_coords = []
-        for landmark in self.landmarks:
-            x_px = int(landmark.x * frame_width)
-            y_px = int(landmark.y * frame_height)
-            pixel_coords.append((x_px, y_px))
-        return pixel_coords
-    
+        return [
+            (int(lm.x * frame_width), int(lm.y * frame_height))
+            for lm in self.landmarks
+        ]
+
     def get_hand_size(self) -> float:
-        """
-        Get hand size as distance between wrist and middle MCP
-        This is used as reference for relative threshold calculations
-        
-        Returns:
-            Hand size (normalized distance)
-        """
         wrist = self.landmarks[self.WRIST]
         middle_mcp = self.landmarks[self.MIDDLE_MCP]
-        
         dx = middle_mcp.x - wrist.x
         dy = middle_mcp.y - wrist.y
-        
         return np.sqrt(dx * dx + dy * dy)
 
+    def get_palm_center(self) -> Tuple[float, float]:
+        """Average of wrist and all MCP joints."""
+        indices = [0, 5, 9, 13, 17]
+        xs = [self.landmarks[i].x for i in indices]
+        ys = [self.landmarks[i].y for i in indices]
+        return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+
+class HandTrackingResult:
+    """Result of processing a frame — may contain 0, 1, or 2 hands."""
+
+    def __init__(self):
+        self.hands: List[HandLandmarks] = []
+
+    @property
+    def dominant(self) -> Optional[HandLandmarks]:
+        """Get dominant hand (first matching configured handedness)."""
+        return self.hands[0] if self.hands else None
+
+    def get_hand(self, handedness: str) -> Optional[HandLandmarks]:
+        for h in self.hands:
+            if h.handedness == handedness:
+                return h
+        return None
+
+    @property
+    def count(self) -> int:
+        return len(self.hands)
+
+
 class HandTracker:
-    """
-    MediaPipe-based hand tracker with drawing capabilities
-    """
-    
+    """MediaPipe-based hand tracker with two-hand support."""
+
     def __init__(self,
-                 max_num_hands: int = 1,
-                 min_detection_confidence: float = 0.7,
-                 min_tracking_confidence: float = 0.5,
-                 static_image_mode: bool = False):
-        """
-        Initialize hand tracker
-        
-        Args:
-            max_num_hands: Maximum number of hands to detect
-            min_detection_confidence: Minimum detection confidence
-            min_tracking_confidence: Minimum tracking confidence  
-            static_image_mode: Whether to process each frame independently
-        """
+                 max_num_hands: int = 2,
+                 min_detection_confidence: float = 0.8,
+                 min_tracking_confidence: float = 0.7,
+                 static_image_mode: bool = False,
+                 model_complexity: int = 1):
         if not MEDIAPIPE_AVAILABLE:
-            raise ImportError("MediaPipe is not available. Please install mediapipe")
-        
+            raise ImportError("MediaPipe is not available")
         if not CV2_AVAILABLE:
-            raise ImportError("OpenCV is not available. Please install opencv-python")
-        
-        self.max_num_hands = max_num_hands
-        self.min_detection_confidence = min_detection_confidence
-        self.min_tracking_confidence = min_tracking_confidence
-        self.static_image_mode = static_image_mode
-        
-        # Initialize MediaPipe
+            raise ImportError("OpenCV is not available")
+
         self.mp_hands = mp.solutions.hands
         self.mp_drawing = mp.solutions.drawing_utils
         self.mp_drawing_styles = mp.solutions.drawing_styles
-        
+
         self.hands = self.mp_hands.Hands(
             static_image_mode=static_image_mode,
             max_num_hands=max_num_hands,
             min_detection_confidence=min_detection_confidence,
-            min_tracking_confidence=min_tracking_confidence
+            min_tracking_confidence=min_tracking_confidence,
+            model_complexity=model_complexity,
         )
-        
-        print(f"HandTracker initialized (max_hands={max_num_hands}, "
-              f"detection_conf={min_detection_confidence}, tracking_conf={min_tracking_confidence})")
-    
-    def process_frame(self, frame: np.ndarray) -> Optional[HandLandmarks]:
-        """
-        Process a frame to detect hand landmarks
-        
-        Args:
-            frame: Input frame (BGR format from OpenCV)
-            
-        Returns:
-            HandLandmarks object if hand detected, None otherwise
-        """
-        # Convert BGR to RGB (MediaPipe expects RGB)
+
+    def process_frame(self, frame: np.ndarray) -> HandTrackingResult:
+        """Process a frame and return all detected hands with handedness."""
+        result = HandTrackingResult()
+
+        # Don't copy — just set writable flag for performance
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Process frame
-        results = self.hands.process(rgb_frame)
-        
-        if results.multi_hand_landmarks:
-            # Return first hand landmarks (since max_num_hands=1)
-            hand_landmarks = results.multi_hand_landmarks[0]
-            
-            # Convert to our format
-            landmarks = []
-            for landmark in hand_landmarks.landmark:
-                landmarks.append(HandLandmark(
-                    x=landmark.x,
-                    y=landmark.y,
-                    z=landmark.z
-                ))
-            
-            return HandLandmarks(landmarks)
-        
-        return None
-    
-    def draw_landmarks(self, frame: np.ndarray, hand_landmarks: HandLandmarks) -> np.ndarray:
-        """
-        Draw hand landmarks on frame
-        
-        Args:
-            frame: Input frame to draw on
-            hand_landmarks: Hand landmarks to draw
-            
-        Returns:
-            Frame with landmarks drawn
-        """
-        # Convert our landmarks back to MediaPipe format for drawing
+        rgb_frame.flags.writeable = False
+        mp_results = self.hands.process(rgb_frame)
+
+        if mp_results.multi_hand_landmarks and mp_results.multi_handedness:
+            for hand_lms, hand_info in zip(
+                mp_results.multi_hand_landmarks,
+                mp_results.multi_handedness
+            ):
+                # MediaPipe reports handedness from camera's perspective
+                # Since we mirror, "Right" in MP = user's right hand
+                handedness = hand_info.classification[0].label
+                landmarks = [
+                    HandLandmark(x=lm.x, y=lm.y, z=lm.z)
+                    for lm in hand_lms.landmark
+                ]
+                result.hands.append(HandLandmarks(landmarks, handedness))
+
+        return result
+
+    def draw_landmarks(self, frame: np.ndarray,
+                       hand_landmarks: HandLandmarks,
+                       color: Optional[Tuple[int, int, int]] = None) -> np.ndarray:
+        """Draw hand landmarks on frame."""
         mp_landmarks = type('MockLandmarks', (), {})()
         mp_landmarks.landmark = []
-        
-        for landmark in hand_landmarks.landmarks:
-            mp_landmark = type('MockLandmark', (), {})()
-            mp_landmark.x = landmark.x
-            mp_landmark.y = landmark.y
-            mp_landmark.z = landmark.z
-            mp_landmarks.landmark.append(mp_landmark)
-        
-        # Draw landmarks and connections
-        self.mp_drawing.draw_landmarks(
-            frame,
-            mp_landmarks,
-            self.mp_hands.HAND_CONNECTIONS,
-            self.mp_drawing_styles.get_default_hand_landmarks_style(),
-            self.mp_drawing_styles.get_default_hand_connections_style()
-        )
-        
+        for lm in hand_landmarks.landmarks:
+            ml = type('MockLandmark', (), {})()
+            ml.x, ml.y, ml.z = lm.x, lm.y, lm.z
+            mp_landmarks.landmark.append(ml)
+
+        if color:
+            landmark_style = self.mp_drawing.DrawingSpec(color=color, thickness=2, circle_radius=2)
+            connection_style = self.mp_drawing.DrawingSpec(color=color, thickness=1)
+            self.mp_drawing.draw_landmarks(
+                frame, mp_landmarks, self.mp_hands.HAND_CONNECTIONS,
+                landmark_style, connection_style
+            )
+        else:
+            self.mp_drawing.draw_landmarks(
+                frame, mp_landmarks, self.mp_hands.HAND_CONNECTIONS,
+                self.mp_drawing_styles.get_default_hand_landmarks_style(),
+                self.mp_drawing_styles.get_default_hand_connections_style()
+            )
         return frame
-    
+
     def close(self) -> None:
-        """Close the hand tracker and release resources"""
         if hasattr(self, 'hands') and self.hands:
             self.hands.close()
-            print("HandTracker closed")
-
-def test_hand_tracker(duration_seconds: int = 10) -> bool:
-    """
-    Test hand tracker with live camera feed
-    
-    Args:
-        duration_seconds: How long to test (seconds)
-        
-    Returns:
-        True if test successful, False otherwise
-    """
-    if not CV2_AVAILABLE or not MEDIAPIPE_AVAILABLE:
-        print("Missing dependencies for hand tracker test")
-        return False
-    
-    try:
-        from camera import Camera
-        
-        print(f"Testing hand tracker for {duration_seconds} seconds...")
-        print("Show your hand to the camera!")
-        
-        with Camera() as camera:
-            tracker = HandTracker()
-            
-            frame_count = 0
-            detection_count = 0
-            import time
-            start_time = time.time()
-            
-            try:
-                while time.time() - start_time < duration_seconds:
-                    ret, frame = camera.read()
-                    
-                    if not ret:
-                        continue
-                    
-                    # Process frame for hand detection
-                    hand_landmarks = tracker.process_frame(frame)
-                    
-                    frame_count += 1
-                    
-                    if hand_landmarks:
-                        detection_count += 1
-                        
-                        # Draw landmarks
-                        frame = tracker.draw_landmarks(frame, hand_landmarks)
-                        
-                        # Print hand size for testing
-                        if detection_count % 30 == 0:
-                            hand_size = hand_landmarks.get_hand_size()
-                            print(f"Hand detected! Size: {hand_size:.3f}")
-                    
-                    # Print stats every 60 frames
-                    if frame_count % 60 == 0:
-                        detection_rate = detection_count / frame_count * 100
-                        fps = camera.get_fps()
-                        print(f"Frame {frame_count}: Detection rate: {detection_rate:.1f}%, FPS: {fps:.1f}")
-                
-                # Final stats
-                total_time = time.time() - start_time
-                detection_rate = detection_count / frame_count * 100 if frame_count > 0 else 0
-                
-                print(f"\nHand tracker test completed:")
-                print(f"  Total frames: {frame_count}")
-                print(f"  Detections: {detection_count}")
-                print(f"  Detection rate: {detection_rate:.1f}%")
-                print(f"  Average FPS: {camera.get_fps():.1f}")
-                
-                # Test passes if we processed frames and FPS > 15
-                if frame_count > 0 and camera.get_fps() >= 15:
-                    print("✅ Hand tracker test PASSED")
-                    return True
-                else:
-                    print("❌ Hand tracker test FAILED")
-                    return False
-                    
-            finally:
-                tracker.close()
-                
-    except Exception as e:
-        print(f"Hand tracker test failed: {e}")
-        return False
-
-if __name__ == "__main__":
-    # Test the hand tracker
-    test_hand_tracker()

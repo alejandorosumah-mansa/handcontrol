@@ -1,11 +1,13 @@
 """
-Camera capture module for HandControl
-Handles webcam access, frame capture, mirroring, and FPS tracking
+Threaded camera capture for HandControl
+Captures frames on a background thread so processing never blocks capture.
+Always provides the latest frame (skips old ones).
 """
 import time
-from typing import Optional, Tuple, List
-import numpy as np
+import threading
+from typing import Optional, Tuple
 from collections import deque
+import numpy as np
 
 try:
     import cv2
@@ -13,229 +15,137 @@ try:
 except ImportError:
     CV2_AVAILABLE = False
 
+
 class Camera:
     """
-    Webcam capture with horizontal mirroring and FPS tracking
+    Threaded webcam capture with frame skipping.
+    The capture thread runs independently — callers always get the latest frame.
     """
-    
-    def __init__(self, 
+
+    def __init__(self,
                  camera_index: int = 0,
-                 width: int = 640, 
+                 width: int = 640,
                  height: int = 480,
                  fps_target: int = 30,
                  mirror: bool = True,
+                 use_threading: bool = True,
                  fps_window_size: int = 30):
-        """
-        Initialize camera capture
-        
-        Args:
-            camera_index: Camera device index (0 for default)
-            width: Frame width
-            height: Frame height  
-            fps_target: Target FPS (for reference, not enforced)
-            mirror: Whether to flip frame horizontally (mirror effect)
-            fps_window_size: Number of frames for rolling FPS average
-        """
         if not CV2_AVAILABLE:
-            raise ImportError("OpenCV (cv2) is not available. Please install opencv-python")
-            
+            raise ImportError("OpenCV is not available")
+
         self.camera_index = camera_index
         self.width = width
         self.height = height
         self.fps_target = fps_target
         self.mirror = mirror
+        self.use_threading = use_threading
         self.fps_window_size = fps_window_size
-        
+
         # FPS tracking
         self.frame_times: deque = deque(maxlen=fps_window_size)
         self.last_frame_time = time.time()
-        
-        # Camera capture object
+
+        # Threading state
+        self._lock = threading.Lock()
+        self._latest_frame: Optional[np.ndarray] = None
+        self._frame_ready = threading.Event()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
         self.cap: Optional[cv2.VideoCapture] = None
         self.is_opened = False
-        
+
     def open(self) -> bool:
-        """
-        Open camera connection
-        
-        Returns:
-            True if camera opened successfully, False otherwise
-        """
-        if not CV2_AVAILABLE:
-            print("Error: OpenCV not available")
-            return False
-            
         try:
             self.cap = cv2.VideoCapture(self.camera_index)
-            
             if not self.cap.isOpened():
-                print(f"Error: Could not open camera {self.camera_index}")
                 return False
-            
-            # Set camera properties
+
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
             self.cap.set(cv2.CAP_PROP_FPS, self.fps_target)
-            
-            # Test frame capture
+            # Minimize buffer to reduce latency
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
             ret, frame = self.cap.read()
             if not ret:
-                print("Error: Could not read frame from camera")
                 self.cap.release()
                 return False
-            
+
             self.is_opened = True
-            print(f"Camera {self.camera_index} opened successfully ({frame.shape[1]}x{frame.shape[0]})")
+
+            if self.use_threading:
+                self._running = True
+                self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+                self._thread.start()
+
             return True
-            
         except Exception as e:
             print(f"Error opening camera: {e}")
             if self.cap:
                 self.cap.release()
             return False
-    
-    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
-        """
-        Read a frame from the camera
-        
-        Returns:
-            Tuple of (success, frame). Frame is None if read failed.
-            Frame is horizontally flipped if mirror=True.
-        """
-        if not self.is_opened or not self.cap:
-            return False, None
-        
-        try:
+
+    def _capture_loop(self) -> None:
+        """Background thread: continuously grab the latest frame."""
+        while self._running and self.cap and self.cap.isOpened():
             ret, frame = self.cap.read()
-            
             if not ret:
-                return False, None
-            
-            # Apply horizontal flip (mirror effect)
+                continue
             if self.mirror:
                 frame = cv2.flip(frame, 1)
-            
-            # Update FPS tracking
-            current_time = time.time()
-            self.frame_times.append(current_time - self.last_frame_time)
-            self.last_frame_time = current_time
-            
-            return True, frame
-            
-        except Exception as e:
-            print(f"Error reading frame: {e}")
+            with self._lock:
+                self._latest_frame = frame
+            self._frame_ready.set()
+
+    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+        if not self.is_opened or not self.cap:
             return False, None
-    
+
+        if self.use_threading:
+            with self._lock:
+                frame = self._latest_frame
+            if frame is None:
+                return False, None
+            # Update FPS tracking
+            now = time.time()
+            self.frame_times.append(now - self.last_frame_time)
+            self.last_frame_time = now
+            return True, frame.copy()
+        else:
+            ret, frame = self.cap.read()
+            if not ret:
+                return False, None
+            if self.mirror:
+                frame = cv2.flip(frame, 1)
+            now = time.time()
+            self.frame_times.append(now - self.last_frame_time)
+            self.last_frame_time = now
+            return True, frame
+
     def get_fps(self) -> float:
-        """
-        Get current FPS (rolling average)
-        
-        Returns:
-            Current FPS, or 0 if no frames captured yet
-        """
         if len(self.frame_times) == 0:
             return 0.0
-        
-        avg_frame_time = sum(self.frame_times) / len(self.frame_times)
-        return 1.0 / avg_frame_time if avg_frame_time > 0 else 0.0
-    
-    def get_frame_shape(self) -> Optional[Tuple[int, int, int]]:
-        """
-        Get current frame shape (height, width, channels)
-        
-        Returns:
-            Frame shape tuple or None if camera not opened
-        """
-        if not self.is_opened or not self.cap:
-            return None
-        
-        ret, frame = self.cap.read()
-        if ret:
-            return frame.shape
-        return None
-    
+        avg = sum(self.frame_times) / len(self.frame_times)
+        return 1.0 / avg if avg > 0 else 0.0
+
     def close(self) -> None:
-        """Close camera connection"""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2.0)
+            self._thread = None
         if self.cap:
             self.cap.release()
             self.is_opened = False
-            print(f"Camera {self.camera_index} closed")
-    
+
     def __enter__(self):
-        """Context manager entry"""
         if not self.open():
             raise RuntimeError("Failed to open camera")
         return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit"""
+
+    def __exit__(self, *args):
         self.close()
-    
+
     def __del__(self):
-        """Destructor - ensure camera is closed"""
         if hasattr(self, 'cap'):
             self.close()
-
-def test_camera(camera_index: int = 0, duration_seconds: int = 10) -> bool:
-    """
-    Test camera functionality
-    
-    Args:
-        camera_index: Camera device index to test
-        duration_seconds: How long to test (seconds)
-        
-    Returns:
-        True if camera test successful, False otherwise
-    """
-    if not CV2_AVAILABLE:
-        print("OpenCV not available - cannot test camera")
-        return False
-    
-    print(f"Testing camera {camera_index} for {duration_seconds} seconds...")
-    
-    try:
-        with Camera(camera_index=camera_index) as camera:
-            start_time = time.time()
-            frame_count = 0
-            
-            while time.time() - start_time < duration_seconds:
-                ret, frame = camera.read()
-                
-                if not ret:
-                    print("Failed to read frame")
-                    return False
-                
-                frame_count += 1
-                
-                # Print stats every 30 frames
-                if frame_count % 30 == 0:
-                    fps = camera.get_fps()
-                    print(f"Frame {frame_count}: {frame.shape}, FPS: {fps:.1f}")
-            
-            # Final stats
-            total_time = time.time() - start_time
-            avg_fps = frame_count / total_time
-            rolling_fps = camera.get_fps()
-            
-            print(f"\nCamera test completed:")
-            print(f"  Total frames: {frame_count}")
-            print(f"  Total time: {total_time:.1f}s")
-            print(f"  Average FPS: {avg_fps:.1f}")
-            print(f"  Rolling FPS: {rolling_fps:.1f}")
-            print(f"  Frame shape: {camera.get_frame_shape()}")
-            
-            # Check if FPS is reasonable
-            if rolling_fps >= 15:
-                print("✅ Camera test PASSED")
-                return True
-            else:
-                print("❌ Camera test FAILED - FPS too low")
-                return False
-                
-    except Exception as e:
-        print(f"Camera test failed with exception: {e}")
-        return False
-
-if __name__ == "__main__":
-    # Test the camera module
-    test_camera()
