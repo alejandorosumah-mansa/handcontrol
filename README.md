@@ -64,9 +64,34 @@ Key settings in `config.yaml`:
 
 ## Build macOS App
 
+### Recommended: Python 3.11+ (Fixes cv2 corruption)
+
 ```bash
-python build_app.py
+# Install Python 3.11 (if not available)
+brew install python@3.11
+
+# Build with Python 3.11 (recommended)
+make build-py311
+# or
+./build_app_py311.py
+
 # Output: dist/Minority Report.app
+```
+
+### Legacy: Current Python (may fail on Python 3.9)
+
+```bash
+python build_app.py  # May fail with cv2.abi3.so corruption on Python 3.9
+```
+
+### Build Commands
+
+```bash
+make help           # Show all build options
+make build-py311    # Build with Python 3.11 (recommended)
+make clean          # Clean build artifacts  
+make test           # Test the built app
+make dmg            # Create DMG installer
 ```
 
 ## Tests
