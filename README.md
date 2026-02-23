@@ -31,23 +31,28 @@ Control your Mac with hand gestures using your webcam. Two-hand tracking, perspe
 | 🤏🤏 Both hands pinch | Resize window |
 | 🖐️ All 5 fingers (1s) | Keyboard mode |
 
-## Quick Start
+## Install (macOS)
+
+1. **[Download MinorityReport.dmg](https://github.com/alejandorosumah-mansa/handcontrol/releases/latest/download/MinorityReport.dmg)**
+2. Open the DMG, drag **Minority Report** to Applications
+3. Double-click to run
+4. Grant camera + accessibility permissions when prompted
+
+Done. That's it.
+
+> First launch: macOS may say "unidentified developer." Right-click the app → Open → Open to bypass.
+
+## Dev Setup
+
+If you want to run from source or contribute:
 
 ```bash
-# Clone
 git clone https://github.com/alejandorosumah-mansa/handcontrol.git
 cd handcontrol
-
-# Install
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-
-# Run
 python main.py
-
-# Or calibrate first
-python -m handcontrol --calibrate
 ```
 
 ## Configuration
